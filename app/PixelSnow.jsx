@@ -4,6 +4,7 @@
 import { useEffect, useRef } from 'react';
 
 import './PixelSnow.css';
+import { createSnowPile, containsSnow, depositSnow, stepSnowPile, resizeSnowPile } from './snow-physics.mjs';
 
 const SPRITES = {
   square: [
@@ -123,7 +124,18 @@ precision highp int;
 uniform sampler2D uPile;
 uniform float uTime;
 uniform float uLight;
+uniform sampler2D uGrains;
+uniform bool uTilted;
+uniform vec2 uGrainGrid;
+uniform vec2 uSnowGrid;
+uniform float uCellSize;
+uniform vec2 uGravity;
 out vec4 outColor;
+
+float grainAt(ivec2 cell) {
+  if (cell.x < 0 || cell.y < 0 || cell.x >= int(uGrainGrid.x) || cell.y >= int(uGrainGrid.y)) return 0.0;
+  return texelFetch(uGrains, cell, 0).r;
+}
 
 float hash(vec2 p) {
   p = fract(p * vec2(123.34, 456.21));
@@ -133,6 +145,16 @@ float hash(vec2 p) {
 
 void main() {
   ivec2 cell = ivec2(gl_FragCoord.xy);
+  if (uTilted) {
+    vec2 screen = vec2(gl_FragCoord.x, uSnowGrid.y - gl_FragCoord.y);
+    ivec2 grain = ivec2(floor(screen / uCellSize));
+    if (grainAt(grain) < 0.5) discard;
+    ivec2 upstream = grain - ivec2(round(uGravity));
+    float crest = 1.0 - grainAt(upstream);
+    float sparkle = step(0.985, hash(vec2(cell) + floor(uTime)));
+    outColor = vec4(0.7 + crest * 0.25, crest * 0.45 + sparkle * 0.2, 0.0, 1.0) * uLight;
+    return;
+  }
   float height = texelFetch(uPile, ivec2(cell.x, 0), 0).r;
   float row = float(cell.y);
   if (row >= floor(height + 0.5)) discard;
@@ -323,6 +345,7 @@ export default function PixelSnow({
   paused = false,
   dpr,
   className = '',
+  gravityRef = /** @type {import('react').RefObject<{ x: number, y: number, active: boolean }> | null} */ (null),
   ...rest
 }) {
   const containerRef = useRef(null);
@@ -348,7 +371,8 @@ export default function PixelSnow({
     opacity: clamp(opacity, 0, 1),
     lightMode,
     paused,
-    dpr
+    dpr,
+    gravityRef
   };
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
@@ -430,6 +454,20 @@ export default function PixelSnow({
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     let pile = new Float32Array(0);
     let pileWidth = 0;
+    const grainTexture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, grainTexture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    // Both samplers must have complete textures, including before tilt starts.
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, 1, 1, 0, gl.RED, gl.UNSIGNED_BYTE, new Uint8Array(1));
+    gl.bindTexture(gl.TEXTURE_2D, pileTexture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, 1, 1, 0, gl.RED, gl.FLOAT, new Float32Array(1));
+    let grains = null;
+    let grainWidth = 0;
+    let grainHeight = 0;
+    const gravity = { x: 0, y: 1, angle: Math.PI / 2 };
     const down = [createTarget(gl.LINEAR), createTarget(gl.LINEAR), createTarget(gl.LINEAR)];
     const up = [createTarget(gl.LINEAR), createTarget(gl.LINEAR)];
 
@@ -478,6 +516,18 @@ export default function PixelSnow({
       flake.level = pickLevel(rng(), s);
       flake.x = rng() * (view.width + 40) - 20;
       flake.y = top ? -10 - rng() * 30 : rng() * view.height;
+      if (top && grains) {
+        // Emit from either upstream edge, weighted by the incoming flux.
+        const horizontal = Math.abs(gravity.x) * view.height;
+        const vertical = Math.abs(gravity.y) * view.width;
+        if (rng() * (horizontal + vertical) < horizontal) {
+          flake.x = gravity.x > 0 ? -8 : view.width + 8;
+          flake.y = rng() * view.height;
+        } else {
+          flake.x = rng() * view.width;
+          flake.y = gravity.y > 0 ? -8 : view.height + 8;
+        }
+      }
       flake.vx = 0;
       flake.vy = LEVEL_FALL[flake.level];
       flake.phase = rng() * Math.PI * 2;
@@ -514,8 +564,10 @@ export default function PixelSnow({
         const level = flake.level;
         const parallax = 1 - s.depth * (1 - (level + 1) / LEVELS) * 0.75;
         const swing = Math.sin(state.time * flake.rate + flake.phase) * s.sway * (6 + level * 7);
-        const targetX = (windSpeed * parallax + swing) * flake.drift;
-        const targetY = LEVEL_FALL[level] * parallax * fall * flake.drift;
+        const fallSpeed = LEVEL_FALL[level] * parallax * fall * flake.drift;
+        const drift = (windSpeed * parallax + swing) * flake.drift;
+        const targetX = grains ? gravity.x * fallSpeed + gravity.y * drift * 0.25 : drift;
+        const targetY = grains ? gravity.y * fallSpeed - gravity.x * drift * 0.25 : fallSpeed;
         const ease = 1 - Math.exp(-dt * 2.2);
         flake.vx += (targetX - flake.vx) * ease;
         flake.vy += (targetY - flake.vy) * ease;
@@ -533,6 +585,22 @@ export default function PixelSnow({
         }
         flake.x += flake.vx * dt;
         flake.y += flake.vy * dt;
+        if (grains) {
+          const pastEdge = (gravity.x > 0.05 && flake.x >= view.width) ||
+            (gravity.x < -0.05 && flake.x <= 0) ||
+            (gravity.y > 0.05 && flake.y >= view.height) ||
+            (gravity.y < -0.05 && flake.y <= 0);
+          if (s.accumulate && (pastEdge || containsSnow(grains, flake.x, flake.y))) {
+            depositSnow(grains, flake.x, flake.y, gravity);
+            spawn(flake, s, true);
+            flake.reveal = -1;
+          } else if (flake.x < -margin || flake.x > view.width + margin ||
+            flake.y < -margin || flake.y > view.height + margin) {
+            spawn(flake, s, true);
+            flake.reveal = -1;
+          }
+          continue;
+        }
         if (settle) {
           const column = Math.floor(flake.x / view.pixel);
           if (column >= 0 && column < pile.length) {
@@ -629,7 +697,7 @@ export default function PixelSnow({
       gl.viewport(0, 0, snow.width, snow.height);
       gl.clearColor(0, 0, 0, 0);
       gl.clear(gl.COLOR_BUFFER_BIT);
-      if (pile.length && pile.some(height => height > 0.4)) {
+      if (grains || (pile.length && pile.some(height => height > 0.4))) {
         gl.bindTexture(gl.TEXTURE_2D, pileTexture);
         if (pileWidth !== pile.length) {
           pileWidth = pile.length;
@@ -644,6 +712,24 @@ export default function PixelSnow({
         gl.uniform1i(pileProgram.uniforms.uPile, 0);
         gl.uniform1f(pileProgram.uniforms.uTime, state.time);
         gl.uniform1f(pileProgram.uniforms.uLight, 1 - s.depth * 0.1);
+        gl.uniform1i(pileProgram.uniforms.uTilted, grains ? 1 : 0);
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, grainTexture);
+        if (grains) {
+          gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+          if (grainWidth !== grains.columns || grainHeight !== grains.rows) {
+            grainWidth = grains.columns;
+            grainHeight = grains.rows;
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, grainWidth, grainHeight, 0, gl.RED, gl.UNSIGNED_BYTE, grains.cells);
+          } else {
+            gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, grainWidth, grainHeight, gl.RED, gl.UNSIGNED_BYTE, grains.cells);
+          }
+          gl.uniform2f(pileProgram.uniforms.uGrainGrid, grains.columns, grains.rows);
+          gl.uniform2f(pileProgram.uniforms.uSnowGrid, view.gridWidth, view.gridHeight);
+          gl.uniform1f(pileProgram.uniforms.uCellSize, grains.cellSize / view.pixel);
+          gl.uniform2f(pileProgram.uniforms.uGravity, gravity.x, gravity.y);
+        }
+        gl.uniform1i(pileProgram.uniforms.uGrains, 1);
         gl.bindVertexArray(quadVao);
         gl.drawArrays(gl.TRIANGLES, 0, 3);
       }
@@ -707,6 +793,28 @@ export default function PixelSnow({
       run(composite, null, canvas.width, canvas.height);
     };
 
+    const updateGravity = (s, dt) => {
+      const input = s.gravityRef?.current;
+      if (input?.active && !grains) {
+        grains = createSnowPile(view.width, view.height);
+        // Transfer the settled snow, with a thin initial dusting for immediate feedback.
+        for (let x = 0; x < grains.columns; x++) {
+          const column = Math.min(pile.length - 1, Math.floor((x + 0.5) * grains.cellSize / view.pixel));
+          const height = Math.max(grains.cellSize, (pile[column] || 0) * view.pixel);
+          for (let y = view.height - grains.cellSize / 2; y > view.height - height; y -= grains.cellSize) {
+            depositSnow(grains, (x + 0.5) * grains.cellSize, y, gravity);
+          }
+        }
+      }
+      if (!grains) return;
+      const target = input?.active ? Math.atan2(input.y, input.x) : Math.PI / 2;
+      // Smooth the angle rather than the vector, so opposite directions never cancel out.
+      const delta = Math.atan2(Math.sin(target - gravity.angle), Math.cos(target - gravity.angle));
+      gravity.angle += delta * (1 - Math.exp(-dt * 4));
+      gravity.x = Math.cos(gravity.angle);
+      gravity.y = Math.sin(gravity.angle);
+    };
+
     const frame = now => {
       raf = 0;
       if (!visible || document.hidden) return;
@@ -723,8 +831,10 @@ export default function PixelSnow({
       populate(s);
       if (moving) {
         state.time += dt;
+        updateGravity(s, dt);
+        if (grains) stepSnowPile(grains, gravity, dt);
         simulate(s, dt);
-        settlePile(s, dt);
+        if (!grains) settlePile(s, dt);
       }
       render();
       if (moving || Math.abs(goal - state.push) > 0.001) raf = requestAnimationFrame(frame);
@@ -740,6 +850,9 @@ export default function PixelSnow({
       const width = Math.max(1, container.clientWidth);
       const height = Math.max(1, container.clientHeight);
       const ratio = Math.min(s.dpr || window.devicePixelRatio || 1, 2);
+      if (grains && (view.width !== width || view.height !== height)) {
+        grains = resizeSnowPile(grains, width, height, gravity);
+      }
       view.width = width;
       view.height = height;
       view.ratio = ratio;
@@ -755,6 +868,7 @@ export default function PixelSnow({
     };
 
     const onPointerMove = event => {
+      if (event.pointerType === 'touch') return;
       const rect = container.getBoundingClientRect();
       const x = event.clientX - rect.left;
       const y = event.clientY - rect.top;
@@ -834,6 +948,7 @@ export default function PixelSnow({
       for (const entry of Object.values(programs)) gl.deleteProgram(entry.program);
       gl.deleteTexture(atlasTexture);
       gl.deleteTexture(pileTexture);
+      gl.deleteTexture(grainTexture);
       gl.deleteBuffer(quadBuffer);
       gl.deleteBuffer(cornerBuffer);
       gl.deleteBuffer(instanceBuffer);
