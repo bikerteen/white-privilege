@@ -1,10 +1,25 @@
 import Image from "next/image";
-import Snowfall from "./Snowfall";
+import PixelSnow from "./PixelSnow";
 
 export default function Home() {
   return (
     <main className="landing">
-      <Snowfall />
+      <div className="snow-background" aria-hidden="true">
+        <PixelSnow
+          color="#ffffff"
+          variant="snowflake"
+          density={0.5}
+          speed={3}
+          wind={0.25}
+          flakeSize={1}
+          pixelSize={1}
+          glow={1.95}
+          mouseInteraction
+          accumulate
+          lightMode={false}
+          dpr={1.5}
+        />
+      </div>
       <section className="launch" aria-labelledby="brand-name">
         <h1 id="brand-name" className="brand">
           white privilege<sup>TM</sup>
